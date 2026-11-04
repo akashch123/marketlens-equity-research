@@ -87,7 +87,14 @@ st.header("4. Peer comparison")
 st.write("Peer data is deliberately editable. Populate current peer price, diluted shares and earnings on a consistent basis before interpreting the comparison.")
 peer_df = peers.copy()
 if not peer_df.empty:
-    st.dataframe(peer_df, use_container_width=True, hide_index=True)
+    peer_df = st.data_editor(
+        peer_df, use_container_width=True, hide_index=True,
+        num_rows="dynamic", key="editable_peer_comparison",
+        column_config={
+            "market_cap_gbp_m": st.column_config.NumberColumn("Market cap (£m)", min_value=0.0, format="%.2f"),
+            "earnings_gbp_m": st.column_config.NumberColumn("Net earnings (£m)", format="%.2f"),
+        },
+    )
     st.caption("Peer median P/E will calculate when peer earnings and market capitalisation fields are populated.")
     stats = peer_statistics(peer_df)
     a,b,c = st.columns(3)
@@ -135,3 +142,82 @@ st.download_button("Download current valuation inputs (CSV)",
                                        "adjusted_earnings_gbp_m":adjusted_profit,"normalised_earnings_gbp_m":normalised_profit,
                                        "net_debt_including_leases_gbp_m":net_debt_m}]).to_csv(index=False),
                    file_name="marketlens_mks_inputs.csv", mime="text/csv")
+
+# Extended five-year research models
+from src.forecast import capm, wacc, forecast, dcf, economic_profit
+
+st.header('7. Five-year forecast & intrinsic valuation')
+st.caption('Analyst assumptions are illustrative starting points, not management guidance. Financial figures are £m; rates are annual.')
+with st.expander('CAPM and WACC assumptions', expanded=True):
+    k1,k2,k3,k4 = st.columns(4)
+    rf=k1.number_input('Risk-free rate (%)',value=4.0,step=0.25)/100
+    beta=k2.number_input('Levered equity beta',value=1.0,step=0.1)
+    erp=k3.number_input('Equity risk premium (%)',value=5.5,step=0.25)/100
+    crp=k4.number_input('Country risk premium (%)',value=0.0,step=0.25)/100
+    k5,k6,k7 = st.columns(3)
+    debt_cost=k5.number_input('Pre-tax cost of debt (%)',value=5.0,step=0.25)/100
+    tax=k6.number_input('Forecast cash tax rate (%)',value=25.0,step=0.5)/100
+    debt_for_wacc=k7.number_input('Interest-bearing debt for WACC (£m)',min_value=0.0,value=2410.0,step=10.0,
+                                    help='Verify lease/debt definition and avoid double counting net debt.')
+    ke=capm(rf,beta,erp,crp)
+    kw=wacc(ke,debt_cost,tax,mcap or 0,debt_for_wacc) if mcap else None
+    a,b=st.columns(2)
+    a.metric('CAPM cost of equity',f'{ke:.2%}')
+    b.metric('Weighted average cost of capital',f'{kw:.2%}' if kw is not None else '—')
+
+st.subheader('Five-year operating assumptions')
+initial_nwc=st.number_input('Opening operating net working capital (£m)',value=0.0,step=10.0,
+                             help='Enter the actual opening NWC for correct first-year cash flow.')
+assumptions=pd.DataFrame({
+    'Year':[f'FY+{i}' for i in range(1,6)],
+    'Revenue growth %':[4.5]*5,
+    'EBIT margin %':[5.0,5.3,5.6,5.9,6.2],
+    'D&A / sales %':[3.0]*5,
+    'CapEx / sales %':[4.0]*5,
+    'Operating NWC / sales %':[1.0]*5,
+})
+assumptions=st.data_editor(assumptions,hide_index=True,use_container_width=True,num_rows='fixed',key='forecast_assumptions')
+try:
+    fc=forecast(revenue,
+        (assumptions['Revenue growth %']/100).tolist(),
+        (assumptions['EBIT margin %']/100).tolist(),tax,
+        (assumptions['D&A / sales %']/100).tolist(),
+        (assumptions['CapEx / sales %']/100).tolist(),
+        (assumptions['Operating NWC / sales %']/100).tolist(),initial_nwc)
+    st.dataframe(fc.style.format({col:'{:,.1f}' for col in fc.columns if col!='Year'}),use_container_width=True,hide_index=True)
+    st.line_chart(fc.set_index('Year')[['Revenue','EBIT','FCFF']])
+    st.download_button('Download five-year forecast CSV',fc.to_csv(index=False),file_name='marketlens_mks_forecast.csv')
+    st.subheader('Discounted cash flow (FCFF)')
+    tg=st.number_input('Terminal perpetual growth (%)',value=2.0,step=0.25)/100
+    discount_override=st.checkbox('Override WACC for valuation',value=False)
+    valuation_wacc=st.number_input('Valuation discount rate (%)',value=9.0,step=0.25)/100 if discount_override else kw
+    if valuation_wacc is not None:
+        result=dcf(fc['FCFF'].tolist(),valuation_wacc,tg,net_debt_m,shares_m)
+        d1,d2,d3,d4=st.columns(4)
+        d1.metric('DCF enterprise value',f"£{result['enterprise_value']:,.0f}m")
+        d2.metric('DCF equity value',f"£{result['equity_value']:,.0f}m")
+        d3.metric('DCF implied price',f"{result['price_pence']:,.1f}p")
+        d4.metric('Terminal share of EV',f"{result['terminal_weight']:.1%}" if result['terminal_weight'] is not None else '—')
+        st.caption('EV-to-equity bridge subtracts net debt as entered in the sidebar. Confirm treatment of leases, pensions, minority interests, cash and non-operating assets.')
+        st.subheader('DCF sensitivity: implied price (pence)')
+        sensitivities=[]
+        for rate in [valuation_wacc-.01,valuation_wacc-.005,valuation_wacc,valuation_wacc+.005,valuation_wacc+.01]:
+            row={'WACC':f'{rate:.2%}'}
+            for g in [tg-.005,tg,tg+.005]:
+                try: row[f'g={g:.2%}']=round(dcf(fc['FCFF'].tolist(),rate,g,net_debt_m,shares_m)['price_pence'],1)
+                except ValueError: row[f'g={g:.2%}']=None
+            sensitivities.append(row)
+        st.dataframe(pd.DataFrame(sensitivities),hide_index=True,use_container_width=True)
+        st.subheader('Economic Returns Model (ROIC vs WACC)')
+        opening_ic=st.number_input('Opening invested capital (£m)',min_value=1.0,value=8000.0,step=100.0,
+                                   help='Enter verified operating invested capital; default is illustrative.')
+        reinvestment=(fc['CapEx']-fc['D&A']+fc['Change in NWC']).tolist()
+        er=economic_profit(fc['NOPAT'].tolist(),opening_ic,reinvestment,valuation_wacc,tg,net_debt_m,shares_m)
+        st.dataframe(er['years'].style.format({'opening_capital':'{:,.1f}','roic':'{:.1%}',
+                          'economic_profit':'{:,.1f}','pv_ep':'{:,.1f}'}),hide_index=True,use_container_width=True)
+        e1,e2=st.columns(2)
+        e1.metric('Economic-profit implied price',f"{er['price_pence']:,.1f}p")
+        e2.metric('DCF vs economic-profit difference',f"{er['price_pence']-result['price_pence']:+,.1f}p")
+        st.warning('Economic-profit terminal value here grows Year-5 economic profit perpetually. This simplifying assumption need not reconcile with the FCFF terminal value. Treat differences as a modelling check, not independent confirmation.')
+except (ValueError, TypeError, ZeroDivisionError) as exc:
+    st.error(f'Check forecast inputs: {exc}')
